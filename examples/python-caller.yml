@@ -1,0 +1,27 @@
+# Example caller for the reusable Python CI workflow.
+
+name: Python CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  security-events: write
+
+jobs:
+  ci:
+    uses: OWNER/ci-workflows/.github/workflows/python.yml@v1
+    with:
+      python-version: "3.12"
+      package-manager: pip
+      run-sonar: true
+      build-image: true
+      push-image: ${{ github.ref == 'refs/heads/main' }}
+      image-name: myorg/myapp
+    secrets:
+      sonar-token: ${{ secrets.SONAR_TOKEN }}

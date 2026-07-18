@@ -1,0 +1,75 @@
+# Example: how a consuming repository calls the reusable Terraform workflow.
+#
+# Copy this into <consumer-repo>/.github/workflows/ and adjust the inputs.
+# Replace OWNER/ci-workflows and the version tag (@v1) to match this repo.
+
+name: Terraform
+
+on:
+  pull_request:
+    paths:
+      - "infra/**"
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+
+# Least privilege at the caller level; the reusable workflow requests what it needs.
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+jobs:
+  # On pull requests: run a plan and post it back as a comment.
+  plan:
+    if: github.event_name == 'pull_request'
+    uses: OWNER/ci-workflows/.github/workflows/terraform.yml@v1
+    with:
+      working-directory: infra
+      terraform-version: "1.9.8"
+      action: plan
+      backend-config-file: backend/dev.hcl
+      var-file: env/dev.tfvars
+      cloud-provider: aws
+      aws-role-to-assume: arn:aws:iam::111122223333:role/gha-terraform-plan
+      aws-region: us-east-1
+
+  # On merge to main: apply, gated by the `production` GitHub Environment
+  # (configure required reviewers on that environment for manual approval).
+  apply:
+    if: github.event_name == 'push'
+    uses: OWNER/ci-workflows/.github/workflows/terraform.yml@v1
+    with:
+      working-directory: infra
+      terraform-version: "1.9.8"
+      action: apply
+      backend-config-file: backend/prod.hcl
+      var-file: env/prod.tfvars
+      environment: production
+      cloud-provider: aws
+      aws-role-to-assume: arn:aws:iam::111122223333:role/gha-terraform-apply
+      aws-region: us-east-1
+
+  # Passing extra environment variables via the `extra-env` secret.
+  #
+  # `extra-env` is a newline-separated list of KEY=VALUE pairs exported before
+  # Terraform runs. Use it for TF_VAR_* inputs, provider tokens, or any env the
+  # backend needs. Because it is a secret, values are masked in the logs.
+  #
+  # The `|` block scalar keeps each pair on its own line. Mix literals with
+  # references to repo/org/environment secrets as needed.
+  plan-with-extra-env:
+    if: github.event_name == 'pull_request'
+    uses: OWNER/ci-workflows/.github/workflows/terraform.yml@v1
+    with:
+      working-directory: infra
+      action: plan
+      cloud-provider: aws
+      aws-role-to-assume: arn:aws:iam::111122223333:role/gha-terraform-plan
+      aws-region: us-east-1
+    secrets:
+      extra-env: |
+        TF_VAR_db_password=${{ secrets.DB_PASSWORD }}
+        TF_VAR_environment=dev
+        CLOUDFLARE_API_TOKEN=${{ secrets.CLOUDFLARE_API_TOKEN }}

@@ -1,0 +1,336 @@
+name: Reusable Python CI
+
+# ---------------------------------------------------------------------------
+# Production-grade reusable CI for Python (pip or Poetry).
+#
+# Pipeline: install -> lint (ruff) -> unit test (pytest +coverage) ->
+# SonarQube -> Docker build -> Trivy image scan -> push.
+#
+# SonarQube runs via the standalone scanner action (correct for Python); it
+# consumes the coverage.xml produced by pytest-cov.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      # -- Build / test -----------------------------------------------------
+      working-directory:
+        description: "Project directory."
+        type: string
+        default: "."
+      python-version:
+        description: "Python version to install."
+        type: string
+        default: "3.12"
+      package-manager:
+        description: "Dependency manager: pip | poetry."
+        type: string
+        default: "pip"
+      install-command:
+        description: "Override the dependency install command."
+        type: string
+        default: ""
+      test-command:
+        description: "Override the test command. Default runs pytest with coverage.xml."
+        type: string
+        default: ""
+      run-tests:
+        description: "Run unit tests."
+        type: boolean
+        default: true
+      run-lint:
+        description: "Run ruff lint."
+        type: boolean
+        default: true
+
+      # -- SonarQube --------------------------------------------------------
+      run-sonar:
+        description: "Run SonarQube analysis."
+        type: boolean
+        default: false
+      sonar-host-url:
+        description: "SonarQube server URL (omit for SonarCloud)."
+        type: string
+        default: ""
+
+      # -- Docker image -----------------------------------------------------
+      build-image:
+        description: "Build a Docker image."
+        type: boolean
+        default: false
+      push-image:
+        description: "Push the image (only after a passing scan)."
+        type: boolean
+        default: false
+      scan-image:
+        description: "Scan the built image with Trivy."
+        type: boolean
+        default: true
+      registry:
+        description: "Container registry host."
+        type: string
+        default: "ghcr.io"
+      image-name:
+        description: "Image repository. Defaults to the GitHub repo (lowercased)."
+        type: string
+        default: ""
+      dockerfile:
+        description: "Path to the Dockerfile (relative to docker-context)."
+        type: string
+        default: "Dockerfile"
+      docker-context:
+        description: "Docker build context (relative to working-directory)."
+        type: string
+        default: "."
+      platform:
+        description: "Target platform (single arch): linux/amd64 or linux/arm64 (Graviton)."
+        type: string
+        default: "linux/amd64"
+      trivy-severity:
+        description: "Comma-separated Trivy severities that count as findings."
+        type: string
+        default: "CRITICAL,HIGH"
+      fail-on-scan:
+        description: "Fail when Trivy finds vulnerabilities at the given severities."
+        type: boolean
+        default: true
+
+      # -- Amazon ECR (OIDC role authentication) ---------------------------
+      ecr:
+        description: "Push to Amazon ECR using OIDC role auth instead of a static registry login."
+        type: boolean
+        default: false
+      aws-role-to-assume:
+        description: "IAM role ARN to assume via OIDC (required when ecr=true)."
+        type: string
+        default: ""
+      aws-region:
+        description: "AWS region for ECR (ecr=true)."
+        type: string
+        default: "us-east-1"
+      ecr-create-repo:
+        description: "Create the ECR repository (scan-on-push) if it does not already exist."
+        type: boolean
+        default: false
+
+      # -- Behaviour --------------------------------------------------------
+      runs-on:
+        description: "Runner label."
+        type: string
+        default: "ubuntu-latest"
+      environment:
+        description: "GitHub Environment for the image job."
+        type: string
+        default: ""
+
+    secrets:
+      sonar-token:
+        required: false
+      registry-username:
+        required: false
+      registry-password:
+        required: false
+
+    outputs:
+      image-ref:
+        description: "Fully qualified image reference that was built."
+        value: ${{ jobs.image.outputs.image-ref }}
+
+concurrency:
+  group: python-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  security-events: write
+
+jobs:
+  # =========================================================================
+  build-test:
+    name: build & test
+    runs-on: ${{ inputs.runs-on }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python ${{ inputs.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: ${{ inputs.package-manager }}
+
+      - name: Install dependencies
+        run: |
+          if [ -n "${{ inputs.install-command }}" ]; then
+            ${{ inputs.install-command }}
+          elif [ "${{ inputs.package-manager }}" = "poetry" ]; then
+            pipx install poetry
+            poetry install --no-interaction --no-ansi
+          else
+            python -m pip install --upgrade pip
+            if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+            if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+            pip install pytest pytest-cov ruff
+          fi
+
+      - name: Lint (ruff)
+        if: ${{ inputs.run-lint }}
+        run: |
+          if [ "${{ inputs.package-manager }}" = "poetry" ]; then
+            poetry run ruff check .
+          else
+            ruff check .
+          fi
+
+      - name: Run tests
+        if: ${{ inputs.run-tests }}
+        run: |
+          if [ -n "${{ inputs.test-command }}" ]; then
+            ${{ inputs.test-command }}
+          elif [ "${{ inputs.package-manager }}" = "poetry" ]; then
+            poetry run pytest --cov --cov-report=xml --junitxml=junit.xml
+          else
+            pytest --cov --cov-report=xml --junitxml=junit.xml
+          fi
+
+      - name: SonarQube analysis
+        if: ${{ inputs.run-sonar }}
+        uses: SonarSource/sonarqube-scan-action@v8
+        env:
+          SONAR_TOKEN: ${{ secrets.sonar-token }}
+          SONAR_HOST_URL: ${{ inputs.sonar-host-url }}
+        with:
+          projectBaseDir: ${{ inputs.working-directory }}
+
+      - name: Upload test reports
+        if: ${{ always() && inputs.run-tests }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-test-reports
+          path: |
+            ${{ inputs.working-directory }}/junit.xml
+            ${{ inputs.working-directory }}/coverage.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # =========================================================================
+  image:
+    name: docker build & scan
+    needs: build-test
+    if: ${{ inputs.build-image }}
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.environment }}
+    outputs:
+      image-ref: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # -- Amazon ECR auth via OIDC role (only when ecr=true) --------------
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ inputs.ecr }}
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ inputs.aws-role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        if: ${{ inputs.ecr }}
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Ensure ECR repository exists
+        if: ${{ inputs.ecr && inputs.ecr-create-repo }}
+        shell: bash
+        env:
+          REPO_NAME: ${{ inputs.image-name || github.repository }}
+        run: |
+          repo="$(echo "$REPO_NAME" | tr '[:upper:]' '[:lower:]')"
+          aws ecr describe-repositories --repository-names "$repo" --region "${{ inputs.aws-region }}" >/dev/null 2>&1 \
+            || aws ecr create-repository --repository-name "$repo" --region "${{ inputs.aws-region }}" \
+                 --image-scanning-configuration scanOnPush=true
+
+      - name: Resolve image name
+        id: name
+        shell: bash
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          # ECR: registry host comes from the ecr-login step. Otherwise use the input.
+          if [ "${{ inputs.ecr }}" = "true" ]; then registry="$ECR_REGISTRY"; else registry="${{ inputs.registry }}"; fi
+          name="${{ inputs.image-name }}"
+          if [ -z "$name" ]; then name="${{ github.repository }}"; fi
+          echo "image=$(echo "$registry/$name" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Docker metadata (tags & labels)
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.name.outputs.image }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # Only needed when cross-building (target arch differs from the runner).
+      # Use a native runner (e.g. runs-on: ubuntu-24.04-arm for arm64) to skip it.
+      - name: Set up QEMU
+        if: ${{ (contains(inputs.platform, 'arm') && runner.arch == 'X64') || (contains(inputs.platform, 'amd') && runner.arch == 'ARM64') }}
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to ${{ inputs.registry }}
+        if: ${{ inputs.push-image && !inputs.ecr }}
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ secrets.registry-username || github.actor }}
+          password: ${{ secrets.registry-password || secrets.GITHUB_TOKEN }}
+
+      # Build the image ONCE (single-arch, loaded locally) with its final tags,
+      # plus a throwaway `ci-scan` tag for the scanner to reference.
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.working-directory }}/${{ inputs.docker-context }}
+          file: ${{ inputs.working-directory }}/${{ inputs.docker-context }}/${{ inputs.dockerfile }}
+          load: true
+          platforms: ${{ inputs.platform }}
+          tags: |
+            ${{ steps.meta.outputs.tags }}
+            ${{ steps.name.outputs.image }}:ci-scan
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image with Trivy
+        if: ${{ inputs.scan-image }}
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          image-ref: ${{ steps.name.outputs.image }}:ci-scan
+          format: table
+          severity: ${{ inputs.trivy-severity }}
+          exit-code: ${{ inputs.fail-on-scan && '1' || '0' }}
+          ignore-unfixed: true
+
+      # The image is already built (for the target arch) and scanned — push its
+      # tags straight from the local daemon. No second build.
+      - name: Push image
+        if: ${{ inputs.push-image }}
+        shell: bash
+        run: |
+          printf '%s\n' "${{ steps.meta.outputs.tags }}" | while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            docker push "$tag"
+          done

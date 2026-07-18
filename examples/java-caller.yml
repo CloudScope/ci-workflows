@@ -1,0 +1,58 @@
+# Example caller for the reusable Java CI workflow.
+# Copy into <consumer-repo>/.github/workflows/ and adjust OWNER + inputs.
+
+name: Java CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  security-events: write
+
+jobs:
+  # --- Option A: push to GitHub Container Registry (default) ---------------
+  ci:
+    uses: OWNER/ci-workflows/.github/workflows/java.yml@v1
+    with:
+      java-version: "21"
+      build-tool: maven
+      run-sonar: true
+      sonar-project-key: myorg_myapp
+      # Build & push the image only on main; PRs just build + scan.
+      build-image: true
+      push-image: ${{ github.ref == 'refs/heads/main' }}
+      image-name: myorg/myapp
+      # Single target arch. For arm64/Graviton, prefer a native runner:
+      #   platform: linux/arm64  +  runs-on: ubuntu-24.04-arm
+      platform: linux/amd64
+      environment: ${{ github.ref == 'refs/heads/main' && 'production' || '' }}
+    secrets:
+      sonar-token: ${{ secrets.SONAR_TOKEN }}
+      # ghcr.io auth defaults to GITHUB_TOKEN — only set these for other registries.
+      # registry-username: ${{ secrets.REGISTRY_USERNAME }}
+      # registry-password: ${{ secrets.REGISTRY_PASSWORD }}
+
+  # --- Option B: push to Amazon ECR with OIDC role auth (no static keys) ---
+  # The IAM role's trust policy must allow token.actions.githubusercontent.com
+  # for this repo. The role needs ecr:GetAuthorizationToken + push permissions
+  # (and ecr:CreateRepository if ecr-create-repo is true).
+  ci-ecr:
+    uses: OWNER/ci-workflows/.github/workflows/java.yml@v1
+    with:
+      java-version: "21"
+      build-tool: maven
+      build-image: true
+      push-image: ${{ github.ref == 'refs/heads/main' }}
+      ecr: true
+      aws-role-to-assume: arn:aws:iam::111122223333:role/gha-ecr-push
+      aws-region: us-east-1
+      image-name: myapp                 # ECR repository name (no registry host)
+      ecr-create-repo: true             # create the repo on first push
+    secrets:
+      sonar-token: ${{ secrets.SONAR_TOKEN }}
+      # No registry-username/password needed — auth is via the assumed IAM role.

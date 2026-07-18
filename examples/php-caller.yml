@@ -1,0 +1,29 @@
+# Example caller for the reusable PHP CI workflow.
+
+name: PHP CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  security-events: write
+
+jobs:
+  ci:
+    uses: OWNER/ci-workflows/.github/workflows/php.yml@v1
+    with:
+      php-version: "8.3"
+      coverage-driver: pcov
+      run-static-analysis: true
+      static-analysis-command: vendor/bin/phpstan analyse --no-progress
+      run-sonar: true
+      build-image: true
+      push-image: ${{ github.ref == 'refs/heads/main' }}
+      image-name: myorg/myapp
+    secrets:
+      sonar-token: ${{ secrets.SONAR_TOKEN }}

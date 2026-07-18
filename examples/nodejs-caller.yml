@@ -1,0 +1,27 @@
+# Example caller for the reusable Node.js CI workflow.
+
+name: Node CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  security-events: write
+
+jobs:
+  ci:
+    uses: OWNER/ci-workflows/.github/workflows/nodejs.yml@v1
+    with:
+      node-version: "20"
+      package-manager: pnpm
+      run-sonar: true
+      build-image: true
+      push-image: ${{ github.ref == 'refs/heads/main' }}
+      image-name: myorg/myapp
+    secrets:
+      sonar-token: ${{ secrets.SONAR_TOKEN }}

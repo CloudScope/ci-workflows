@@ -1,0 +1,271 @@
+name: Reusable Terraform
+
+# ---------------------------------------------------------------------------
+# Reusable Terraform workflow.
+#
+# Runs the standard Terraform lifecycle (fmt -> init -> validate -> plan ->
+# apply) in a single, opinionated pipeline that callers configure via inputs.
+#
+# Highlights:
+#   * Version pinning for both Terraform and the workflow behaviour.
+#   * Keyless cloud auth via OIDC (AWS / Azure / GCP) — no long-lived secrets.
+#   * Plan output posted back to the pull request as a sticky comment.
+#   * Apply is gated behind an `action` input AND a GitHub Environment so you
+#     get native required-reviewer approvals for production.
+#
+# See docs/terraform.md and examples/terraform-caller.yml for usage.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      # -- Core -------------------------------------------------------------
+      working-directory:
+        description: "Directory that holds the root Terraform module."
+        type: string
+        default: "."
+      terraform-version:
+        description: 'Terraform version to install (exact, or a constraint like "1.9.x", or "latest").'
+        type: string
+        default: "1.9.8"
+      action:
+        description: "What to run: plan | apply | destroy."
+        type: string
+        default: "plan"
+
+      # -- Backend / workspace ---------------------------------------------
+      backend-config-file:
+        description: "Path (relative to working-directory) to a backend .hcl/.tfvars file passed via -backend-config."
+        type: string
+        default: ""
+      var-file:
+        description: "Path (relative to working-directory) to a .tfvars file passed via -var-file."
+        type: string
+        default: ""
+      workspace:
+        description: "Terraform workspace to select/create. Empty means the default workspace."
+        type: string
+        default: ""
+
+      # -- Cloud auth (OIDC) ------------------------------------------------
+      cloud-provider:
+        description: "Cloud to authenticate against via OIDC: none | aws | azure | gcp."
+        type: string
+        default: "none"
+      aws-role-to-assume:
+        description: "ARN of the AWS IAM role to assume via OIDC (cloud-provider=aws)."
+        type: string
+        default: ""
+      aws-region:
+        description: "AWS region (cloud-provider=aws)."
+        type: string
+        default: "us-east-1"
+
+      # -- Behaviour --------------------------------------------------------
+      environment:
+        description: "GitHub Environment to run under (enables required reviewers / env secrets). Empty disables it."
+        type: string
+        default: ""
+      runs-on:
+        description: "Runner label for the jobs."
+        type: string
+        default: "ubuntu-latest"
+      fail-on-fmt:
+        description: "Fail the pipeline when `terraform fmt -check` reports unformatted files."
+        type: boolean
+        default: true
+      comment-on-pr:
+        description: "Post the plan output as a sticky comment on the triggering pull request."
+        type: boolean
+        default: true
+
+    secrets:
+      # Optional generic secrets — passed through as env vars for backends or
+      # providers that still need static credentials (prefer OIDC when you can).
+      azure-client-id:
+        required: false
+      azure-tenant-id:
+        required: false
+      azure-subscription-id:
+        required: false
+      gcp-workload-identity-provider:
+        required: false
+      gcp-service-account:
+        required: false
+      extra-env:
+        description: "Newline-separated KEY=VALUE pairs exported before Terraform runs (e.g. TF_VAR_*)."
+        required: false
+
+    outputs:
+      plan-exitcode:
+        description: "Exit code of `terraform plan -detailed-exitcode` (0=no changes, 2=changes)."
+        value: ${{ jobs.terraform.outputs.plan-exitcode }}
+
+# Only allow one Terraform run per ref+workspace at a time; apply must never race.
+concurrency:
+  group: terraform-${{ github.workflow }}-${{ github.ref }}-${{ inputs.working-directory }}-${{ inputs.workspace }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write       # required for OIDC cloud auth
+  pull-requests: write  # required to post the plan comment
+
+jobs:
+  terraform:
+    name: terraform ${{ inputs.action }}
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.environment }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    outputs:
+      plan-exitcode: ${{ steps.plan.outputs.exitcode }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Export extra environment variables
+        if: ${{ secrets.extra-env != '' }}
+        shell: bash
+        env:
+          EXTRA_ENV: ${{ secrets.extra-env }}
+        run: |
+          # Persist caller-provided KEY=VALUE lines for later steps.
+          printf '%s\n' "$EXTRA_ENV" | while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            echo "$line" >> "$GITHUB_ENV"
+          done
+
+      # -- Cloud authentication (OIDC, keyless) ----------------------------
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ inputs.cloud-provider == 'aws' }}
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ inputs.aws-role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Configure Azure credentials (OIDC)
+        if: ${{ inputs.cloud-provider == 'azure' }}
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.azure-client-id }}
+          tenant-id: ${{ secrets.azure-tenant-id }}
+          subscription-id: ${{ secrets.azure-subscription-id }}
+
+      - name: Configure GCP credentials (OIDC)
+        if: ${{ inputs.cloud-provider == 'gcp' }}
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.gcp-workload-identity-provider }}
+          service_account: ${{ secrets.gcp-service-account }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+
+      - name: Terraform fmt
+        id: fmt
+        run: terraform fmt -check -recursive -diff
+        continue-on-error: ${{ !inputs.fail-on-fmt }}
+
+      - name: Terraform init
+        id: init
+        run: |
+          init_args=(-input=false)
+          if [ -n "${{ inputs.backend-config-file }}" ]; then
+            init_args+=(-backend-config="${{ inputs.backend-config-file }}")
+          fi
+          terraform init "${init_args[@]}"
+
+      - name: Select workspace
+        if: ${{ inputs.workspace != '' }}
+        run: terraform workspace select -or-create "${{ inputs.workspace }}"
+
+      - name: Terraform validate
+        id: validate
+        run: terraform validate -no-color
+
+      # -- Plan -------------------------------------------------------------
+      - name: Terraform plan
+        id: plan
+        if: ${{ inputs.action != 'apply' }}
+        run: |
+          plan_args=(-input=false -no-color -detailed-exitcode -out=tfplan)
+          if [ -n "${{ inputs.var-file }}" ]; then
+            plan_args+=(-var-file="${{ inputs.var-file }}")
+          fi
+          if [ "${{ inputs.action }}" = "destroy" ]; then
+            plan_args+=(-destroy)
+          fi
+
+          set +e
+          terraform plan "${plan_args[@]}" 2>&1 | tee plan.txt
+          code=${PIPESTATUS[0]}
+          set -e
+
+          echo "exitcode=${code}" >> "$GITHUB_OUTPUT"
+          # 0 = no changes, 2 = changes present, anything else = real error.
+          if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then
+            exit "$code"
+          fi
+
+      - name: Post plan to pull request
+        if: ${{ inputs.action != 'apply' && inputs.comment-on-pr && github.event_name == 'pull_request' }}
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const wd = process.env.WORKING_DIRECTORY;
+            let plan = '';
+            try { plan = fs.readFileSync(`${wd}/plan.txt`, 'utf8'); } catch (e) { plan = 'No plan output captured.'; }
+            // GitHub comments cap at 65536 chars — keep the tail, it holds the summary.
+            const max = 63000;
+            if (plan.length > max) plan = '...(truncated)...\n' + plan.slice(plan.length - max);
+
+            const marker = `<!-- terraform-plan:${wd} -->`;
+            const body = [
+              marker,
+              `### Terraform Plan — \`${wd}\``,
+              `**fmt:** \`${{ steps.fmt.outcome }}\` · **init:** \`${{ steps.init.outcome }}\` · **validate:** \`${{ steps.validate.outcome }}\` · **plan:** \`${{ steps.plan.outcome }}\``,
+              '',
+              '<details><summary>Show plan</summary>',
+              '',
+              '```terraform',
+              plan,
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const existing = comments.data.find(c => c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+        env:
+          WORKING_DIRECTORY: ${{ inputs.working-directory }}
+
+      # -- Apply / Destroy --------------------------------------------------
+      - name: Terraform apply
+        if: ${{ inputs.action == 'apply' }}
+        run: |
+          apply_args=(-input=false -no-color -auto-approve)
+          if [ -n "${{ inputs.var-file }}" ]; then
+            apply_args+=(-var-file="${{ inputs.var-file }}")
+          fi
+          terraform apply "${apply_args[@]}"
+
+      - name: Terraform destroy
+        if: ${{ inputs.action == 'destroy' }}
+        run: |
+          destroy_args=(-input=false -no-color -auto-approve)
+          if [ -n "${{ inputs.var-file }}" ]; then
+            destroy_args+=(-var-file="${{ inputs.var-file }}")
+          fi
+          terraform destroy "${destroy_args[@]}"
